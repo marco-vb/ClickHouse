@@ -13,6 +13,8 @@
 #include <Poco/Net/NetException.h>
 
 #include <Common/logger_useful.h>
+#include <Interpreters/Context.h>
+#include <Interpreters/TLSLog.h>
 
 #if USE_SSL
 #include <Poco/Net/SecureStreamSocketImpl.h>
@@ -45,6 +47,11 @@ HTTPServerRequest::HTTPServerRequest(HTTPContextPtr context, HTTPServerResponse 
 
     auto in = std::make_unique<ReadBufferFromPocoSocket>(session.socket(), read_event);
     socket = session.socket().impl();
+
+    // We need to try logging current TLS connection
+    // before attempting to read from socket, before it potentially throws an exception.
+    if (auto tls_log = Context::getGlobalContextInstance()->getTLSLog(); tls_log != nullptr)
+        tls_log->logTLSConnection(*in, session.socket());
 
     readRequest(*in);  /// Try parse according to RFC7230
 

@@ -26,6 +26,7 @@
 #include <Interpreters/Squashing.h>
 #include <Interpreters/TablesStatus.h>
 #include <Interpreters/executeQuery.h>
+#include <Interpreters/TLSLog.h>
 #include <Parsers/ASTInsertQuery.h>
 #include <Server/TCPServer.h>
 #include <Storages/MergeTree/MergeTreeDataPartUUID.h>
@@ -284,6 +285,11 @@ void TCPHandler::runImpl()
     /// Support for PROXY protocol
     if (parse_proxy_protocol && !receiveProxyHeader())
         return;
+
+    // We need to try logging current TLS connection
+    // before attempting to read from socket, before it potentially throws an exception.
+    if (auto tls_log = server.context()->getTLSLog(); tls_log != nullptr)
+        tls_log->logTLSConnection(*in, socket());
 
     if (in->eof())
     {

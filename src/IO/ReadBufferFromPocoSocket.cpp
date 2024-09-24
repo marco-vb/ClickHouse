@@ -11,6 +11,12 @@
 #include <Common/AsyncTaskExecutor.h>
 #include <Common/checkSSLReturnCode.h>
 
+#include "config.h"
+
+#if USE_SSL
+#include <Poco/Net/SSLException.h>
+#endif
+
 namespace ProfileEvents
 {
     extern const Event NetworkReceiveElapsedMicroseconds;
@@ -30,6 +36,7 @@ namespace ErrorCodes
     extern const int SOCKET_TIMEOUT;
     extern const int CANNOT_READ_FROM_SOCKET;
     extern const int LOGICAL_ERROR;
+    extern const int CLIENT_SSL_CERTIFICATE_ERROR;
 }
 
 ssize_t ReadBufferFromPocoSocketBase::socketReceiveBytesImpl(char * ptr, size_t size)
@@ -78,6 +85,12 @@ ssize_t ReadBufferFromPocoSocketBase::socketReceiveBytesImpl(char * ptr, size_t 
             bytes_read = socket.impl()->receiveBytes(ptr, static_cast<int>(size));
         }
     }
+#if USE_SSL
+    catch (const Poco::Net::SSLException & e)
+    {
+        throw NetException(ErrorCodes::CLIENT_SSL_CERTIFICATE_ERROR, "{}, while reading from socket ({})", e.displayText(), peer_address.toString());
+    }
+#endif
     catch (const Poco::Net::NetException & e)
     {
         throw NetException(ErrorCodes::NETWORK_ERROR, "{}, while reading from socket (peer: {}, local: {})", e.displayText(), peer_address.toString(), socket.address().toString());
