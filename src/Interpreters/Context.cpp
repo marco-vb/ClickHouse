@@ -1678,6 +1678,7 @@ ContextData::ContextData(const ContextData &o) :
     query_factories_info(o.query_factories_info),
     distributed_plan_local_object(o.distributed_plan_local_object),
     query_privileges_info(o.query_privileges_info),
+    abr_query_info(o.abr_query_info),
     async_read_counters(o.async_read_counters),
     query_execution_counters(o.query_execution_counters),
     view_source(o.view_source),
@@ -4550,6 +4551,7 @@ void Context::makeQueryContext()
 {
     query_context = shared_from_this();
     distributed_plan_local_object = std::make_shared<DistributedPlanLocalObject>();
+    abr_query_info = std::make_shared<ABRQueryInfo>();
 
     /// Throttling should not be inherited, otherwise if you will set
     /// throttling for default profile you will not able to overwrite it
@@ -8927,6 +8929,11 @@ size_t Context::getConfigReloaderInterval() const
     return shared->config_reload_interval_ms.load(std::memory_order_relaxed);
 }
 
+InputFormatPtr Context::getInputFormat(const String & name, ReadBuffer & buf, const Block & sample, UInt64 max_block_size) const
+{
+    return getInputFormat(name, buf, sample, max_block_size, std::nullopt);
+}
+
 InputFormatPtr Context::getInputFormat(
     const String & name,
     ReadBuffer & buf,
@@ -8954,9 +8961,19 @@ InputFormatPtr Context::getInputFormat(
         min_block_size_bytes);
 }
 
+OutputFormatPtr Context::getOutputFormat(const String & name, WriteBuffer & buf, const Block & sample) const
+{
+    return getOutputFormat(name, buf, sample, std::nullopt);
+}
+
 OutputFormatPtr Context::getOutputFormat(const String & name, WriteBuffer & buf, const Block & sample, const std::optional<FormatSettings> & format_settings) const
 {
     return FormatFactory::instance().getOutputFormat(name, buf, sample, shared_from_this(), format_settings);
+}
+
+OutputFormatPtr Context::getOutputFormatParallelIfPossible(const String & name, WriteBuffer & buf, const Block & sample) const
+{
+    return getOutputFormatParallelIfPossible(name, buf, sample, std::nullopt);
 }
 
 OutputFormatPtr Context::getOutputFormatParallelIfPossible(const String & name, WriteBuffer & buf, const Block & sample, const std::optional<FormatSettings> & format_settings) const
@@ -9027,6 +9044,11 @@ void Context::stopServers(const ServerType & server_type) const
 void Context::shutdown() TSA_NO_THREAD_SAFETY_ANALYSIS
 {
     shared->shutdown();
+}
+
+bool Context::isShutdownCalled() const
+{
+    return shared->shutdown_called;
 }
 
 

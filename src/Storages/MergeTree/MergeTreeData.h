@@ -377,10 +377,6 @@ public:
 
     MergeTreeDataPartFormat choosePartFormatOnDisk(size_t bytes_uncompressed, size_t rows_count) const;
 
-    /// return pair <exists, pointer to part>. Sometimes we may fail to load existing part (network issues, oom and so on),
-    /// in this case pair of <true, nullptr> is returned.
-    std::pair<bool, MutableDataPartPtr> loadDataPartForRemovalIfExists(const String & name, bool ignore_no_such_key = false);
-
     MergeTreeDataPartBuilder getDataPartBuilder(
         const String & name,
         const VolumePtr & volume,
@@ -586,6 +582,9 @@ public:
     StoragePolicyPtr getStoragePolicy() const override;
 
     bool isMergeTree() const override { return true; }
+
+    /// True when parallel replicas are used.
+    bool producesMergeableState(const ContextPtr & query_context) const override;
 
     bool supportsPrewhere() const override { return true; }
 

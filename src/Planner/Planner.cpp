@@ -299,6 +299,10 @@ FiltersForTableExpressionMap collectFiltersForAnalysis(const QueryTreeNodePtr & 
             return true;
         if (typeid_cast<const StorageView *>(raw))
             return true;
+        /// A storage that needs the whole query executes the filter itself, so there is no `Filter` step above its read either.
+        /// Wrappers such as `Alias` and lazily loaded tables answer for the table they forward to.
+        if (storage_ptr->readRequiresFullQuery())
+            return true;
         return false;
     };
 
@@ -1191,16 +1195,11 @@ void addMergingAggregatedStep(QueryPlan & query_plan,
         settings[Setting::serialize_string_in_memory_with_zero_byte],
         settings[Setting::enable_packed_string_keys_in_aggregation]);
 
-    bool is_remote_storage = false;
-    bool parallel_replicas_from_merge_tree = false;
+    bool produces_mergeable_state = false;
 
     const auto & table_expression_node_to_data = planner_context->getTableExpressionNodeToData();
     if (table_expression_node_to_data.size() == 1)
-    {
-        auto it = table_expression_node_to_data.begin();
-        is_remote_storage = it->second.isRemote();
-        parallel_replicas_from_merge_tree = it->second.isMergeTree() && query_context->canUseParallelReplicasOnInitiator();
-    }
+        produces_mergeable_state = table_expression_node_to_data.begin()->second.producesMergeableState();
 
     auto merging_aggregated = std::make_unique<MergingAggregatedStep>(
         query_plan.getCurrentHeader(),
@@ -1208,7 +1207,7 @@ void addMergingAggregatedStep(QueryPlan & query_plan,
         aggregation_analysis_result.grouping_sets_parameters_list,
         query_analysis_result.aggregate_final,
         /// Grouping sets don't work with distributed_aggregation_memory_efficient enabled (#43989)
-        settings[Setting::distributed_aggregation_memory_efficient] && (is_remote_storage || parallel_replicas_from_merge_tree)
+        settings[Setting::distributed_aggregation_memory_efficient] && produces_mergeable_state
             && !query_analysis_result.aggregation_with_rollup_or_cube_or_grouping_sets,
         settings[Setting::aggregation_memory_efficient_merge_threads],
         query_analysis_result.aggregation_should_produce_results_in_order_of_bucket_number,
@@ -2592,16 +2591,6 @@ void Planner::buildQueryPlanIfNeeded()
     extendQueryContextAndStoragesLifetime(query_plan, planner_context);
 }
 
-/// Returns true if the Planner-level query result cache (with `is_subquery = true` key) should be used.
-/// For actual subqueries (is_subquery=true): explicit SETTINGS `use_query_cache` on the node wins.
-/// For all Planner invocations: `query_cache_for_subqueries` propagation from outer query.
-/// By default, `use_query_cache` does NOT propagate.
-///
-/// Regardless of opt-in, never use the cache for execution kinds where caching is unsafe:
-/// internal queries (e.g. background system queries) and non-initial queries (e.g. `SECONDARY_QUERY`
-/// executed by a replica as part of a distributed query). Caching in those kinds would write/read
-/// per-replica or per-internal entries that the outer query already manages or that bypass the
-/// safety gate `executeQuery` applies via `Context::setCanUseQueryResultCache`.
 /// Gate every Planner-level cache use by the query kind, so an explicit `SETTINGS use_query_cache`
 /// on a subquery cannot bypass the safety check that `executeQuery` performs for the outer query.
 /// Caching internal queries (e.g. background system queries) or non-initial queries (e.g. a
@@ -2612,6 +2601,31 @@ static bool isQueryKindEligibleForSubqueryCache(const ContextPtr & query_context
 {
     return !query_context->isInternalQuery()
         && query_context->getClientInfo().query_kind == ClientInfo::QueryKind::INITIAL_QUERY;
+}
+
+/// Never use the cache in plans that are serialized for remote execution: logical plans are
+/// shipped to another node by parallel replicas with `serialize_query_plan = 1` (see
+/// `createRemotePlanForParallelReplicas`). The cache steps hold node-local state - a
+/// `QueryResultCacheWriter` or the cached chunks themselves - which has no serialized
+/// representation. The cache is populated and read by the plan the initiator executes itself.
+///
+/// Plan-based parallel replicas (`parallel_replicas_plan_based`) are another such case: the plan is
+/// built locally, and `QueryPlanOptimizations::applyParallelReplicas` later serializes a fragment of
+/// it - including the plans of `IN` subquery sets - for the replicas. A fragment holding a cache step
+/// is kept local instead, so the cache would silently disable parallel replicas, and on a warm cache
+/// the remote/local decision would depend on cache contents. The setting is checked on both the local
+/// and the query-level context, so a subquery cannot escape the ban with its own SETTINGS clause.
+static bool isPlanEligibleForSubqueryCache(const SelectQueryOptions & select_query_options, const ContextPtr & query_context)
+{
+    if (select_query_options.build_logical_plan)
+        return false;
+
+    const auto uses_plan_based_parallel_replicas = [](const ContextPtr & context)
+    {
+        return context->getSettingsRef()[Setting::parallel_replicas_plan_based] && context->canUseParallelReplicasOnInitiator();
+    };
+    return !uses_plan_based_parallel_replicas(query_context)
+        && !(query_context->hasQueryContext() && uses_plan_based_parallel_replicas(query_context->getQueryContext()));
 }
 
 /// Returns the explicit `use_query_cache` opt-in / opt-out carried by a node's own query-level
@@ -2666,16 +2680,22 @@ static std::optional<bool> explicitUseQueryCacheSetting(const Node & node)
     return node_context->getSettingsRef()[Setting::use_query_cache];
 }
 
+/// Returns true if the Planner-level query result cache (with `is_subquery = true` key) should be used.
+/// For actual subqueries (is_subquery=true): explicit SETTINGS `use_query_cache` on the node wins.
+/// For all Planner invocations: `query_cache_for_subqueries` propagation from outer query.
+/// By default, `use_query_cache` does NOT propagate.
 static bool shouldUseQueryCacheForSubquery(
     const QueryNode & query_node,
     bool outer_can_use_cache,
     const Settings & settings,
-    bool is_subquery,
+    const SelectQueryOptions & select_query_options,
     bool allow_propagation,
     const ContextPtr & query_context)
 {
-    if (!isQueryKindEligibleForSubqueryCache(query_context))
+    if (!isQueryKindEligibleForSubqueryCache(query_context) || !isPlanEligibleForSubqueryCache(select_query_options, query_context))
         return false;
+
+    const bool is_subquery = select_query_options.is_subquery;
 
     /// Only check explicit per-node `use_query_cache` for actual subqueries.
     /// For the top-level query, this setting is handled by `executeQuery` (with `is_subquery = false` key).
@@ -2836,6 +2856,7 @@ void Planner::buildPlanForUnionNode()
 
     bool should_cache = select_query_options.is_subquery && query_result_cache != nullptr
         && isQueryKindEligibleForSubqueryCache(query_context)
+        && isPlanEligibleForSubqueryCache(select_query_options, query_context)
         && explicit_use_query_cache.value_or(false);
 
     /// An explicit opt-out covers the whole set operation: its arms must not be cached through the
@@ -3002,7 +3023,7 @@ void Planner::buildPlanForQueryNode()
     /// 2. `query_cache_for_subqueries` propagates from outer query (applies to all Planner invocations)
     /// 3. By default, `use_query_cache` does NOT propagate from outer query to subqueries
     bool should_cache = shouldUseQueryCacheForSubquery(query_node, can_use_query_result_cache, settings,
-        select_query_options.is_subquery, allow_query_cache_for_subqueries_propagation, query_context);
+        select_query_options, allow_query_cache_for_subqueries_propagation, query_context);
 
     /// Query result cache must actually exist
     if (should_cache && !query_result_cache)
